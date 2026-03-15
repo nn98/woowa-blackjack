@@ -1,5 +1,5 @@
 // src/services/firebaseRoom.ts
-import { ref, get, set, onValue, off, update } from 'firebase/database';
+import { ref, get, set, onValue, off, update, increment, push, child } from 'firebase/database';
 import { db } from './firebase';
 import { generateDeck, shuffleDeck } from '../utils/deckManager';
 import { calculateTotalScore } from '../utils/gameLogic';
@@ -13,6 +13,9 @@ export const initGameDatabase = async () => {
             initialRooms[`room_${i}`] = { id: `room_${i}`, status: 'WAITING', hostEmail: '', dealer: { cards: [], score: 0, isBust: false }, players: {}, deck: [] };
         }
         await set(ref(db, 'rooms'), initialRooms);
+
+        // [신규] 카지노 전체 전역 통계 노드 생성 (글로벌 딜러 손익)
+        await set(ref(db, 'casinoStats'), { globalDealerPnL: 0 });
 
         const participants = [
             { nickname: '글렌', email: 'jkllhgb@gmail.com' }, { nickname: '시오', email: 'mathasdf0@gmail.com' }, { nickname: '아이큐', email: 'ark182818@gmail.com' }, { nickname: '에버', email: 'galmeagi2@gmail.com' },
@@ -44,6 +47,8 @@ export const forceResetAllRooms = async () => {
         updates[`rooms/${roomId}/activePlayerEmail`] = '';
         updates[`rooms/${roomId}/skipVotes`] = null;
     }
+    // [수정] 강제 초기화 시 글로벌 손익도 0으로 초기화할지 여부 (필요 시 주석 해제)
+    // updates[`casinoStats/globalDealerPnL`] = 0;
     await update(ref(db), updates);
 };
 
@@ -74,49 +79,47 @@ export const joinRoom = async (roomId: string, user: User) => {
     await update(ref(db), updates);
 };
 
-// [버그 픽스] 방 퇴장 로직: 파이어베이스 경로 충돌(조상-자손) 완벽 분리
 export const leaveRoom = async (roomId: string, userEmail: string) => {
     const emailKey = userEmail.replace(/\./g, '_');
-    const roomSnap = await get(ref(db, `rooms/${roomId}`));
+    const roomRef = ref(db, `rooms/${roomId}`);
+    const roomSnap = await get(roomRef);
+
     if (!roomSnap.exists()) return;
 
-    const roomData = roomSnap.val() as RoomType;
-    const updates: Record<string, any> = {};
-    const remainingPlayers = Object.keys(roomData.players || {}).filter(k => k !== emailKey);
+    const roomData = roomSnap.val();
+    const players = roomData.players || {};
+    const remainingPlayerKeys = Object.keys(players).filter(k => k !== emailKey);
 
-    if (remainingPlayers.length === 0) {
-        // 나를 제외하고 남은 사람이 0명일 때 (방 전체 초기화)
-        // 개별 유저 노드가 아닌, players 폴더와 skipVotes 폴더 전체를 null로 덮어씌웁니다.
-        updates[`rooms/${roomId}/status`] = 'WAITING';
-        updates[`rooms/${roomId}/hostEmail`] = '';
-        updates[`rooms/${roomId}/dealer`] = { cards: [], score: 0, isBust: false };
-        updates[`rooms/${roomId}/players`] = null; // 플레이어 전체 비우기
-        updates[`rooms/${roomId}/deck`] = [];
-        updates[`rooms/${roomId}/activePlayerEmail`] = '';
-        updates[`rooms/${roomId}/skipVotes`] = null; // 투표 전체 비우기
+    if (remainingPlayerKeys.length === 0) {
+        await update(roomRef, {
+            status: 'WAITING',
+            hostEmail: '',
+            dealer: { cards: [], score: 0, isBust: false },
+            players: null,
+            deck: [],
+            activePlayerEmail: '',
+            skipVotes: null
+        });
     } else {
-        // 나 외에 다른 유저가 방에 남아 있을 때 (권한 위임 및 내 정보만 삭제)
-        updates[`rooms/${roomId}/players/${emailKey}`] = null;
-        updates[`rooms/${roomId}/skipVotes/${emailKey}`] = null;
+        const updates: Record<string, any> = {};
+        updates[`players/${emailKey}`] = null;
+        updates[`skipVotes/${emailKey}`] = null;
 
-        // 내가 방장이었다면 남은 사람 중 첫 번째에게 방장 위임
         if (roomData.hostEmail === emailKey) {
-            updates[`rooms/${roomId}/hostEmail`] = remainingPlayers[0];
+            updates['hostEmail'] = remainingPlayerKeys[0];
         }
 
-        // 내 턴에 나갔다면 다음 사람에게 턴 넘기기
         if (roomData.activePlayerEmail === emailKey) {
-            const playerKeys = Object.keys(roomData.players || {});
-            const idx = playerKeys.indexOf(emailKey);
+            const idx = Object.keys(players).indexOf(emailKey);
             let nextActive = '';
-            for (let i = idx + 1; i < playerKeys.length; i++) {
-                if (roomData.players[playerKeys[i]].status === 'PLAYING') { nextActive = playerKeys[i]; break; }
+            const keys = Object.keys(players);
+            for (let i = idx + 1; i < keys.length; i++) {
+                if (players[keys[i]].status === 'PLAYING') { nextActive = keys[i]; break; }
             }
-            updates[`rooms/${roomId}/activePlayerEmail`] = nextActive;
+            updates['activePlayerEmail'] = nextActive;
         }
+        await update(roomRef, updates);
     }
-
-    await update(ref(db), updates);
 };
 
 export const toggleReady = (roomId: string, userEmail: string, isReady: boolean) => {
@@ -159,6 +162,9 @@ export const submitPreDecision = async (roomId: string, email: string, isContinu
         updates[`rooms/${roomId}/players/${key}/status`] = 'SURRENDER';
         updates[`rooms/${roomId}/players/${key}/credit`] = finalCredit;
         updates[`users/${key}/credit`] = finalCredit;
+
+        // [수정] Surrender 시 전역(Global) 딜러 손익 누적
+        updates[`casinoStats/globalDealerPnL`] = increment(bet / 2);
 
         const userSnap = await get(ref(db, `users/${key}`));
         if (userSnap.exists()) {
@@ -268,12 +274,16 @@ export const executeDealerAndResult = async (roomId: string, roomData: RoomType)
     const userSnap = await get(ref(db, 'users'));
     const usersData = userSnap.exists() ? userSnap.val() : {};
 
+    let dealerRoundProfit = 0;
+    const historyPlayers: Record<string, any> = {};
+
     Object.entries(roomData.players || {}).forEach(([key, p]) => {
         if (p.status === 'STAND' || p.status === 'PLAYING' || p.status === 'BUST') {
             const pScore = calculateTotalScore(p.cards || []);
             const pBJ = pScore === 21 && (p.cards || []).length === 2;
             const dBJ = dScore === 21 && dealerCards.length === 2;
             let reward = 0;
+
             if (p.status !== 'BUST') {
                 if (pBJ && dBJ) reward = p.betAmount;
                 else if (pBJ && !dBJ) reward = p.betAmount * 2.5;
@@ -281,14 +291,51 @@ export const executeDealerAndResult = async (roomId: string, roomData: RoomType)
                 else if (dScore > 21 || pScore > dScore) reward = p.betAmount * 2;
                 else if (pScore === dScore) reward = p.betAmount;
             }
+
+            const netProfitForDealer = p.betAmount - reward;
+            dealerRoundProfit += netProfitForDealer;
+
+            historyPlayers[key] = {
+                nickname: p.nickname,
+                status: p.status,
+                bet: p.betAmount,
+                reward: reward,
+                netProfit: reward - p.betAmount,
+                score: pScore
+            };
+
             const finalCredit = p.credit + reward;
             updates[`rooms/${roomId}/players/${key}/credit`] = finalCredit;
             updates[`users/${key}/credit`] = finalCredit;
 
             const maxC = usersData[key]?.maxCredit || 1000;
             if (finalCredit > maxC) updates[`users/${key}/maxCredit`] = finalCredit;
+
+        } else if (p.status === 'SURRENDER') {
+            historyPlayers[key] = {
+                nickname: p.nickname,
+                status: 'SURRENDER',
+                bet: p.betAmount,
+                reward: p.betAmount / 2,
+                netProfit: -(p.betAmount / 2),
+                score: calculateTotalScore((p.cards || []).slice(0, 2))
+            };
         }
     });
+
+    // [수정] 라운드 종료 시 발생한 딜러 손익을 전역(Global) 노드에 누적 반영
+    if (dealerRoundProfit !== 0) {
+        updates[`casinoStats/globalDealerPnL`] = increment(dealerRoundProfit);
+    }
+
+    const historyKey = push(child(ref(db), `gameHistory/${roomId}`)).key;
+    updates[`gameHistory/${roomId}/${historyKey}`] = {
+        timestamp: Date.now(),
+        dealerRoundProfit: dealerRoundProfit,
+        dealer: { score: dScore, isBust: dScore > 21 },
+        players: historyPlayers
+    };
+
     await update(ref(db), updates);
 
     setTimeout(() => { resetToWaiting(roomId); }, 7000);
